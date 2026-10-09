@@ -28,7 +28,11 @@ const GEMINI_TAXA = 24000; // taxa padrão do Gemini TTS (usada só se o áudio 
 const GEMINI_MAX_TEXTO = 900; // ~1 min de fala: mantém a resposta abaixo do limite de 4,5 MB da Vercel
 // O Gemini entende melhor instruções de estilo curtas e em inglês.
 const ESTILO_GEMINI_PADRAO =
-  "Natural Brazilian Portuguese, warm audiobook narrator, relaxed pace, natural pauses and expressive intonation.";
+  "Natural Brazilian Portuguese, warm audiobook narrator, steady and fluid pace, expressive intonation, only brief pauses between sentences.";
+// Silêncios: pausas internas maiores que isso são encurtadas; bordas ficam curtas
+// para não haver buraco entre um trecho e outro.
+const SILENCIO_MAX_MS = 350;
+const SILENCIO_BORDA_MS = 60;
 const GEMINI_VOZES = [
   "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe",
   "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib",
@@ -163,6 +167,48 @@ function lerWav(buf) {
 }
 
 // Reduz a taxa (só usado se o áudio passar do limite de tamanho da Vercel).
+// Corta silêncio do começo/fim e encurta pausas longas no meio da fala.
+function comprimirSilencios(pcm, taxa) {
+  const amostrasQuadro = Math.max(1, Math.round(taxa / 100)); // quadros de 10 ms
+  const bytesQuadro = amostrasQuadro * 2;
+  const total = Math.floor(pcm.length / bytesQuadro);
+  if (total < 3) return pcm;
+  const LIMIAR = 600; // ~ -35 dB
+  const silencioso = new Array(total);
+  for (let q = 0; q < total; q++) {
+    let pico = 0;
+    for (let i = q * bytesQuadro; i < (q + 1) * bytesQuadro; i += 2) {
+      const v = Math.abs(pcm.readInt16LE(i));
+      if (v > pico) pico = v;
+    }
+    silencioso[q] = pico < LIMIAR;
+  }
+  let ini = 0; while (ini < total && silencioso[ini]) ini++;
+  let fim = total - 1; while (fim > ini && silencioso[fim]) fim--;
+  if (ini >= total) return pcm; // tudo silêncio: devolve como veio
+
+  const maxQ = Math.round(SILENCIO_MAX_MS / 10);
+  const bordaQ = Math.round(SILENCIO_BORDA_MS / 10);
+  const pedacos = [];
+  const copiar = (a, b) => pedacos.push(pcm.subarray(a * bytesQuadro, b * bytesQuadro));
+  copiar(Math.max(0, ini - bordaQ), ini);
+  let q = ini;
+  while (q <= fim) {
+    if (!silencioso[q]) {
+      let f = q; while (f <= fim && !silencioso[f]) f++;
+      copiar(q, f); q = f;
+    } else {
+      let f = q; while (f <= fim && silencioso[f]) f++;
+      const len = f - q;
+      if (len <= maxQ) copiar(q, f);
+      else { const meio = Math.floor(maxQ / 2); copiar(q, q + meio); copiar(f - (maxQ - meio), f); }
+      q = f;
+    }
+  }
+  copiar(fim + 1, Math.min(total, fim + 1 + bordaQ));
+  return Buffer.concat(pedacos);
+}
+
 function reamostrar(pcm, de, para) {
   const n = Math.floor(pcm.length / 2);
   const m = Math.floor(n * para / de);
@@ -197,7 +243,7 @@ async function falarGeminiCompleto(texto, voz, instrucoes) {
     pcms.push(r.pcm);
     taxa = r.taxa;
   }
-  let pcm = Buffer.concat(pcms);
+  let pcm = comprimirSilencios(Buffer.concat(pcms), taxa);
   if (pcm.length > 4_200_000) { pcm = reamostrar(pcm, taxa, 16000); taxa = 16000; }
   return { audio: pcmParaWav(pcm, taxa), tipo: "audio/wav" };
 }
