@@ -1,0 +1,10 @@
+{
+  "name": "leitor-voz-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend da extensão Leitor em Voz: gera áudio com a OpenAI (gpt-4o-mini-tts)",
+  "engines": {
+    "node": ">=18"
+  }
+}
