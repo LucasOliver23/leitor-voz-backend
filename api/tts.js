@@ -72,8 +72,15 @@ export default async function handler(req, res) {
     });
 
     if (!resposta.ok) {
+      if (resposta.status === 401) {
+        // Nunca repassar a mensagem da OpenAI aqui: ela inclui parte da chave usada.
+        return res.status(502).json({
+          erro: "A OPENAI_API_KEY configurada na Vercel é inválida. Gere uma chave em platform.openai.com/api-keys (começa com sk-), atualize a variável e faça Redeploy.",
+        });
+      }
       let detalhe = "";
       try { detalhe = (await resposta.json())?.error?.message || ""; } catch {}
+      detalhe = detalhe.replace(/sk-[A-Za-z0-9_\-*]+/g, "sk-***");
       return res
         .status(resposta.status === 401 ? 502 : resposta.status)
         .json({ erro: `OpenAI recusou (${resposta.status}). ${detalhe}`.trim() });
