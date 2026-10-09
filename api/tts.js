@@ -24,7 +24,11 @@ const OPENAI_VOZES = [
 
 // ---------------- Gemini ----------------
 const GEMINI_MODELO = "gemini-3.8-flash-tts";
-const GEMINI_TAXA = 16000; // 16 kHz: boa qualidade de voz e arquivo pequeno (limite de resposta da Vercel)
+const GEMINI_TAXA = 24000; // taxa padrão do Gemini TTS (usada só se o áudio vier sem cabeçalho WAV)
+const GEMINI_MAX_TEXTO = 900; // ~1 min de fala: mantém a resposta abaixo do limite de 4,5 MB da Vercel
+// O Gemini entende melhor instruções de estilo curtas e em inglês.
+const ESTILO_GEMINI_PADRAO =
+  "Natural Brazilian Portuguese, warm audiobook narrator, relaxed pace, natural pauses and expressive intonation.";
 const GEMINI_VOZES = [
   "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe",
   "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib",
@@ -88,6 +92,7 @@ class ErroProvedor extends Error {
 
 async function falarGemini(texto, voz, instrucoes) {
   const vozGemini = GEMINI_VOZES.includes(voz) ? voz : (MAPA_VOZES[voz] || "Sulafat");
+  const estilo = instrucoes === INSTRUCOES_PADRAO ? ESTILO_GEMINI_PADRAO : instrucoes;
   const resposta = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
     method: "POST",
     headers: {
@@ -101,10 +106,11 @@ async function falarGemini(texto, voz, instrucoes) {
         content: [{
           type: "text",
           text: texto,
-          annotations: [{ type: "speech_metadata", style: instrucoes }],
+          annotations: [{ type: "speech_metadata", style: estilo }],
         }],
       }],
-      response_format: { type: "audio", mime_type: "audio/l16", sample_rate: GEMINI_TAXA },
+      // Formato padrão documentado: WAV 24 kHz, mono, 16 bits, já com cabeçalho.
+      response_format: { type: "audio" },
       generation_config: { speech_config: [{ voice: vozGemini }] },
     }),
   });
@@ -132,10 +138,68 @@ async function falarGemini(texto, voz, instrucoes) {
   }
   if (!blocos.length) throw new ErroProvedor(502, "O Gemini não devolveu áudio para este trecho.");
 
-  const bruto = Buffer.concat(blocos.map((b) => Buffer.from(b, "base64")));
-  // Se já veio como WAV, devolve direto; senão é PCM puro e ganha o cabeçalho.
-  const wav = bruto.subarray(0, 4).toString() === "RIFF" ? bruto : pcmParaWav(bruto, GEMINI_TAXA);
-  return { audio: wav, tipo: "audio/wav" };
+  // Junta os blocos lendo o cabeçalho WAV de cada um (taxa real informada pelo Gemini).
+  let taxa = GEMINI_TAXA;
+  const pcms = blocos.map((b) => {
+    const r = lerWav(Buffer.from(b, "base64"));
+    if (r.taxa) taxa = r.taxa;
+    return r.pcm;
+  });
+  return { pcm: Buffer.concat(pcms), taxa };
+}
+
+// Extrai o PCM e a taxa de um WAV; se não tiver cabeçalho, trata como PCM puro.
+function lerWav(buf) {
+  if (buf.length < 12 || buf.subarray(0, 4).toString() !== "RIFF") return { pcm: buf, taxa: null };
+  let pos = 12, taxa = null;
+  while (pos + 8 <= buf.length) {
+    const id = buf.subarray(pos, pos + 4).toString();
+    const tam = buf.readUInt32LE(pos + 4);
+    if (id === "fmt ") taxa = buf.readUInt32LE(pos + 12);
+    if (id === "data") return { pcm: buf.subarray(pos + 8, Math.min(buf.length, pos + 8 + tam)), taxa };
+    pos += 8 + tam + (tam % 2);
+  }
+  return { pcm: buf.subarray(44), taxa };
+}
+
+// Reduz a taxa (só usado se o áudio passar do limite de tamanho da Vercel).
+function reamostrar(pcm, de, para) {
+  const n = Math.floor(pcm.length / 2);
+  const m = Math.floor(n * para / de);
+  const saida = Buffer.alloc(m * 2);
+  for (let i = 0; i < m; i++) {
+    const x = i * de / para, a = Math.floor(x), f = x - a;
+    const s0 = pcm.readInt16LE(a * 2), s1 = a + 1 < n ? pcm.readInt16LE((a + 1) * 2) : s0;
+    saida.writeInt16LE(Math.round(s0 + (s1 - s0) * f), i * 2);
+  }
+  return saida;
+}
+
+// Divide textos longos em partes de até GEMINI_MAX_TEXTO, quebrando em frases.
+function partesGemini(texto) {
+  if (texto.length <= GEMINI_MAX_TEXTO) return [texto];
+  const frases = texto.match(/[^.!?…]+(?:[.!?…]+["”’')\]]*|$)\s*/g) || [texto];
+  const partes = [];
+  let atual = "";
+  for (const f of frases) {
+    if (atual && (atual + f).length > GEMINI_MAX_TEXTO) { partes.push(atual.trim()); atual = ""; }
+    atual += f;
+  }
+  if (atual.trim()) partes.push(atual.trim());
+  return partes;
+}
+
+async function falarGeminiCompleto(texto, voz, instrucoes) {
+  const pcms = [];
+  let taxa = GEMINI_TAXA;
+  for (const parte of partesGemini(texto)) {
+    const r = await falarGemini(parte, voz, instrucoes);
+    pcms.push(r.pcm);
+    taxa = r.taxa;
+  }
+  let pcm = Buffer.concat(pcms);
+  if (pcm.length > 4_200_000) { pcm = reamostrar(pcm, taxa, 16000); taxa = 16000; }
+  return { audio: pcmParaWav(pcm, taxa), tipo: "audio/wav" };
 }
 
 async function falarOpenAI(texto, voz, instrucoes) {
@@ -217,7 +281,7 @@ export default async function handler(req, res) {
 
   try {
     const { audio, tipo } = provedor === "gemini"
-      ? await falarGemini(texto, voz, instrucoes)
+      ? await falarGeminiCompleto(texto, voz, instrucoes)
       : await falarOpenAI(texto, voz, instrucoes);
     res.setHeader("Content-Type", tipo);
     res.setHeader("Cache-Control", "no-store");
